@@ -1,0 +1,514 @@
+if not lib then return end
+
+local Items = require 'modules.items.server'
+local Inventory = require 'modules.inventory.server'
+local TriggerEventHooks = require 'modules.hooks.server'
+local Shops = {}
+local locations = shared.target and 'targets' or 'locations'
+
+---@class OxShopItem
+---@field slot number
+---@field weight number
+
+local function setupShopItems(id, shopType, shopName, groups)
+	local shop = id and Shops[shopType][id] or Shops[shopType] --[[@as OxShop]]
+
+	for i = 1, shop.slots do
+		local slot = shop.items[i]
+
+		if slot.grade and not groups then
+			print(('^1attempted to restrict slot %s (%s) to grade %s, but %s has no job restriction^0'):format(id, slot.name, json.encode(slot.grade), shopName))
+			slot.grade = nil
+		end
+
+		local Item = Items(slot.name)
+
+		if Item then
+			---@type OxShopItem
+			slot = {
+				name = Item.name,
+				slot = i,
+				weight = Item.weight,
+				count = slot.count,
+				price = (server.randomprices and (not slot.currency or slot.currency == 'money')) and (math.ceil(slot.price * (math.random(80, 120)/100))) or slot.price or 0,
+				metadata = slot.metadata,
+				license = slot.license,
+				currency = slot.currency,
+				grade = slot.grade
+			}
+
+			if slot.metadata then
+				slot.weight = Inventory.SlotWeight(Item, slot, true)
+			end
+
+			shop.items[i] = slot
+		end
+	end
+end
+
+---@param shopType string
+---@param properties OxShop
+local function registerShopType(shopType, properties)
+	local shopLocations = properties[locations] or properties.locations
+
+	if shopLocations then
+		Shops[shopType] = properties
+	else
+		Shops[shopType] = {
+			label = properties.name,
+			id = shopType,
+			groups = properties.groups or properties.jobs,
+			items = properties.inventory,
+			slots = #properties.inventory,
+			type = 'shop',
+		}
+
+		setupShopItems(nil, shopType, properties.name, properties.groups or properties.jobs)
+	end
+end
+
+---@param shopType string
+---@param id number
+local function createShop(shopType, id)
+	local shop = Shops[shopType]
+
+	if not shop then return end
+
+	local store = (shop[locations] or shop.locations)?[id]
+
+	if not store then return end
+
+	local groups = shop.groups or shop.jobs
+    local coords
+
+    if shared.target then
+        if store.length then
+            local z = store.loc.z + math.abs(store.minZ - store.maxZ) / 2
+            coords = vec3(store.loc.x, store.loc.y, z)
+        else
+            coords = store.coords or store.loc
+        end
+    else
+        coords = store
+    end
+
+	shop[id] = {
+		label = shop.name,
+		id = shopType..' '..id,
+		groups = groups,
+		items = table.clone(shop.inventory),
+		slots = #shop.inventory,
+		type = 'shop',
+		coords = coords,
+		distance = shared.target and shop.targets?[id]?.distance,
+	}
+
+	setupShopItems(id, shopType, shop.name, groups)
+
+	return shop[id]
+end
+
+for shopType, shopDetails in pairs(lib.load('data.shops') or {}) do
+	registerShopType(shopType, shopDetails)
+end
+
+---@param shopType string
+---@param shopDetails OxShop
+exports('RegisterShop', function(shopType, shopDetails)
+	registerShopType(shopType, shopDetails)
+end)
+
+lib.callback.register('ox_inventory:openShop', function(source, data)
+	local playerInv, shop = Inventory(source)
+
+	if not playerInv then return end
+
+	if data then
+		shop = Shops[data.type]
+
+		if not shop then return end
+
+		if not shop.items then
+			shop = (data.id and shop[data.id] or createShop(data.type, data.id))
+
+			if not shop then return end
+		end
+
+		---@cast shop OxShop
+
+		if shop.groups then
+			local group = server.hasGroup(playerInv, shop.groups)
+			if not group then return end
+		end
+
+		if type(shop.coords) == 'vector3' and #(GetEntityCoords(GetPlayerPed(source)) - shop.coords) > 10 then
+			return
+		end
+
+		local shopType, shopId = shop.id:match('^(.-) (%d-)$')
+
+        local hookPayload = {
+            source = source,
+            shopId = shopId,
+			shopType = shopType,
+            label = shop.label,
+            slots = shop.slots,
+            items = shop.items,
+            groups = shop.groups,
+            coords = shop.coords,
+            distance = shop.distance
+        }
+
+        if not TriggerEventHooks('openShop', hookPayload) then return end
+
+		---@diagnostic disable-next-line: assign-type-mismatch
+		playerInv:openInventory(playerInv)
+		playerInv.currentShop = shop.id
+	end
+
+	return { label = playerInv.label, type = playerInv.type, slots = playerInv.slots, weight = playerInv.weight, maxWeight = playerInv.maxWeight }, shop
+end)
+
+local function canAffordItem(inv, currency, price)
+	local canAfford = price >= 0 and Inventory.GetItemCount(inv, currency) >= price
+
+	return canAfford or {
+		type = 'error',
+		description = locale('cannot_afford', ('%s%s'):format((currency == 'money' and locale('$') or math.groupdigits(price)), (currency == 'money' and math.groupdigits(price) or ' '..Items(currency).label)))
+	}
+end
+
+local function removeCurrency(inv, currency, price)
+	Inventory.RemoveItem(inv, currency, price)
+end
+
+local function isRequiredGrade(grade, rank)
+	if type(grade) == "table" then
+		for i=1, #grade do
+			if grade[i] == rank then
+				return true
+			end
+		end
+		return false
+	else
+		return rank >= grade
+	end
+end
+
+lib.callback.register('ox_inventory:buyItem', function(source, data)
+	if data.toType == 'player' then
+		if data.count == nil then data.count = 1 end
+
+		local playerInv = Inventory(source)
+
+		if not playerInv or not playerInv.currentShop then return end
+
+		local shopType, shopId = playerInv.currentShop:match('^(.-) (%d-)$')
+
+		if not shopType then shopType = playerInv.currentShop end
+
+		if shopId then shopId = tonumber(shopId) end
+
+		local shop = shopId and Shops[shopType][shopId] or Shops[shopType]
+		local fromData = shop.items[data.fromSlot]
+		local toData = playerInv.items[data.toSlot]
+
+		if fromData then
+			if fromData.count then
+				if fromData.count == 0 then
+					return false, false, { type = 'error', description = locale('shop_nostock') }
+				elseif data.count > fromData.count then
+					data.count = fromData.count
+				end
+			end
+
+			if fromData.license and server.hasLicense and not server.hasLicense(playerInv, fromData.license) then
+				return false, false, { type = 'error', description = locale('item_unlicensed') }
+			end
+
+			if fromData.grade then
+				local _, rank = server.hasGroup(playerInv, shop.groups)
+				if not isRequiredGrade(fromData.grade, rank) then
+					return false, false, { type = 'error', description = locale('stash_lowgrade') }
+				end
+			end
+
+			local currency = fromData.currency or 'money'
+			local fromItem = Items(fromData.name)
+
+			local result = fromItem.cb and fromItem.cb('buying', fromItem, playerInv, data.fromSlot, shop)
+			if result == false then return false end
+
+			local toItem = toData and Items(toData.name)
+
+			local metadata, count = Items.Metadata(playerInv, fromItem, fromData.metadata and table.clone(fromData.metadata) or {}, data.count)
+			local price = count * fromData.price
+
+			if toData == nil or (fromItem.name == toItem?.name and fromItem.stack and table.matches(toData.metadata, metadata)) then
+				local newWeight = playerInv.weight + (fromItem.weight + (metadata?.weight or 0)) * count
+
+				if newWeight > playerInv.maxWeight then
+					return false, false, { type = 'error', description = locale('cannot_carry') }
+				end
+
+				local canAfford
+				local useBank = data.paymentMethod == 'bank' and currency == 'money'
+				local player = useBank and exports.qbx_core:GetPlayer(source)
+
+				if useBank and player then
+					local bankBalance = player.Functions.GetMoney('bank')
+					if bankBalance < price then
+						canAfford = { type = 'error', description = locale('cannot_afford', ('$%s'):format(math.groupdigits(price))) }
+					else
+						canAfford = true
+					end
+				else
+					canAfford = canAffordItem(playerInv, currency, price)
+				end
+
+				if canAfford ~= true then
+					return false, false, canAfford
+				end
+
+				if not TriggerEventHooks('buyItem', {
+					source = source,
+					shopType = shopType,
+					shopId = shopId,
+					toInventory = playerInv.id,
+					toSlot = data.toSlot,
+					fromSlot = fromData,
+					itemName = fromData.name,
+					metadata = metadata,
+					count = count,
+					price = fromData.price,
+					totalPrice = price,
+					currency = currency,
+					paymentMethod = useBank and 'bank' or 'money'
+				}) then return false end
+
+				Inventory.SetSlot(playerInv, fromItem, count, metadata, data.toSlot)
+				playerInv.weight = newWeight
+				
+				if useBank and player then
+					player.Functions.RemoveMoney('bank', price, "Shop Purchase")
+				else
+					removeCurrency(playerInv, currency, price)
+				end
+
+				if fromData.count then
+					shop.items[data.fromSlot].count = fromData.count - count
+				end
+
+				if server.syncInventory then server.syncInventory(playerInv) end
+
+				local message = locale('purchased_for', count, metadata?.label or fromItem.label, (currency == 'money' and locale('$') or math.groupdigits(price)), (currency == 'money' and math.groupdigits(price) or ' '..Items(currency).label))
+
+				if server.loglevel > 0 then
+					if server.loglevel > 1 or fromData.price >= 500 then
+						lib.logger(playerInv.owner, 'buyItem', ('"%s" %s'):format(playerInv.label, message:lower()), ('shop:%s'):format(shop.label))
+					end
+				end
+
+				return true, {data.toSlot, playerInv.items[data.toSlot], shop.items[data.fromSlot].count and shop.items[data.fromSlot], playerInv.weight}, { type = 'success', description = message }
+			end
+
+			return false, false, { type = 'error', description = locale('unable_stack_items') }
+		end
+	end
+end)
+
+lib.callback.register('ox_inventory:buyCart', function(source, data)
+	local playerInv = Inventory(source)
+	if not playerInv or not playerInv.currentShop then return false end
+
+	local shopType, shopId = playerInv.currentShop:match('^(.-) (%d-)$')
+	if not shopType then shopType = playerInv.currentShop end
+	if shopId then shopId = tonumber(shopId) end
+
+	local shop = shopId and Shops[shopType][shopId] or Shops[shopType]
+
+	local totalCost = 0
+	local totalWeight = 0
+	local itemsToBuy = {}
+
+	if not data.items or #data.items == 0 then
+		return false, { type = 'error', description = "Your cart is empty!" }
+	end
+
+	for _, itemReq in pairs(data.items) do
+		local fromData = shop.items[itemReq.slot]
+		if fromData then
+			local count = itemReq.count
+			if fromData.count and count > fromData.count then count = fromData.count end
+			
+			if count > 0 then
+				if fromData.license and server.hasLicense and not server.hasLicense(playerInv, fromData.license) then
+					return false, { type = 'error', description = locale('item_unlicensed') }
+				end
+
+				if fromData.grade then
+					local _, rank = server.hasGroup(playerInv, shop.groups)
+					if not isRequiredGrade(fromData.grade, rank) then
+						return false, { type = 'error', description = locale('stash_lowgrade') }
+					end
+				end
+
+				local fromItem = Items(fromData.name)
+				local currency = fromData.currency or 'money'
+				
+				if currency ~= 'money' then
+				    return false, { type = 'error', description = "Cart purchases only support money right now." }
+				end
+				
+                if fromItem.stack then
+                    local metadata, finalCount = Items.Metadata(playerInv, fromItem, fromData.metadata and table.clone(fromData.metadata) or {}, count)
+                    
+                    local price = finalCount * fromData.price
+                    local weight = (fromItem.weight + (metadata?.weight or 0)) * finalCount
+                    
+                    totalCost = totalCost + price
+                    totalWeight = totalWeight + weight
+                    table.insert(itemsToBuy, {
+                        fromData = fromData,
+                        count = finalCount,
+                        metadata = metadata,
+                        price = price,
+                        weight = weight,
+                        item = fromItem
+                    })
+                else
+                    for i = 1, count do
+                        local metadata, finalCount = Items.Metadata(playerInv, fromItem, fromData.metadata and table.clone(fromData.metadata) or {}, 1)
+                        
+                        local price = finalCount * fromData.price
+                        local weight = (fromItem.weight + (metadata?.weight or 0)) * finalCount
+                        
+                        totalCost = totalCost + price
+                        totalWeight = totalWeight + weight
+                        table.insert(itemsToBuy, {
+                            fromData = fromData,
+                            count = finalCount,
+                            metadata = metadata,
+                            price = price,
+                            weight = weight,
+                            item = fromItem
+                        })
+                    end
+                end
+			end
+		end
+	end
+
+	if totalWeight + playerInv.weight > playerInv.maxWeight then
+		return false, { type = 'error', description = locale('cannot_carry') }
+	end
+
+    local emptySlots = 0
+    local existingStacks = {}
+    for i = 1, playerInv.slots do
+        local slotData = playerInv.items[i]
+        if not slotData then
+            emptySlots = emptySlots + 1
+        else
+            if slotData.stack then
+                local key = slotData.name
+                if not existingStacks[key] then existingStacks[key] = {} end
+                table.insert(existingStacks[key], slotData.metadata)
+            end
+        end
+    end
+
+    local slotsNeeded = 0
+    local mockStacks = {}
+    
+    for _, buyData in pairs(itemsToBuy) do
+        if buyData.item.stack then
+            local key = buyData.item.name
+            local found = false
+            
+            if existingStacks[key] then
+                for _, meta in pairs(existingStacks[key]) do
+                    if table.matches(meta, buyData.metadata) then
+                        found = true
+                        break
+                    end
+                end
+            end
+            
+            if not found and mockStacks[key] then
+                for _, meta in pairs(mockStacks[key]) do
+                    if table.matches(meta, buyData.metadata) then
+                        found = true
+                        break
+                    end
+                end
+            end
+            
+            if not found then
+                slotsNeeded = slotsNeeded + 1
+                if not mockStacks[key] then mockStacks[key] = {} end
+                table.insert(mockStacks[key], buyData.metadata)
+            end
+        else
+            slotsNeeded = slotsNeeded + 1
+        end
+    end
+
+    if slotsNeeded > emptySlots then
+        return false, { type = 'error', description = locale('cannot_carry') }
+    end
+
+    local useBank = data.paymentMethod == 'bank'
+    local player = useBank and exports.qbx_core:GetPlayer(source)
+
+    if useBank and player then
+        local bankBalance = player.Functions.GetMoney('bank')
+        if bankBalance < totalCost then
+            return false, { type = 'error', description = locale('cannot_afford', ('$%s'):format(math.groupdigits(totalCost))) }
+        end
+    else
+        local canAfford = canAffordItem(playerInv, 'money', totalCost)
+        if canAfford ~= true then
+            return false, canAfford
+        end
+    end
+
+	local addedSlots = {}
+	for _, buyData in pairs(itemsToBuy) do
+		local success, response = Inventory.AddItem(playerInv, buyData.item.name, buyData.count, buyData.metadata, nil, nil, true)
+        
+        if success and response then
+            local toSlotType = type(response)
+            if toSlotType == 'table' then
+                if response.slot then
+                    table.insert(addedSlots, { item = response, inventory = playerInv.id })
+                else
+                    for i = 1, #response do
+                        table.insert(addedSlots, { item = response[i], inventory = playerInv.id })
+                    end
+                end
+            end
+        end
+
+		if buyData.fromData.count then
+			buyData.fromData.count = buyData.fromData.count - buyData.count
+		end
+	end
+
+    if useBank and player then
+        player.Functions.RemoveMoney('bank', totalCost, "Shop Cart Purchase")
+    else
+        removeCurrency(playerInv, 'money', totalCost)
+    end
+
+	if #addedSlots > 0 then
+        playerInv:syncSlotsWithClients(addedSlots, true)
+    end
+
+	if server.syncInventory then server.syncInventory(playerInv) end
+
+	local message = locale('purchased_for', #itemsToBuy, 'cart items', locale('$'), math.groupdigits(totalCost))
+	return true, { type = 'success', description = message }
+end)
+
+server.shops = Shops
