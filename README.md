@@ -9,7 +9,7 @@ A complete inventory system for FiveM, implementing items, weapons, shops, and m
 
 > [!WARNING]
 > This is currently a **beta release** of our redesign. While all features are functional and have been tested as much as possible, we encourage server owners and developers to test thoroughly and report any issues. Your feedback is essential to help us polish the final release!
-> Meanwhile you can join our discord server: discord.gg/onyxscripts
+> Meanwhile you can **join** our **discord server**: https://discord.gg/onyxscripts
 
 ## 📚 Documentation
 
