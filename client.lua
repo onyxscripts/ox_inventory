@@ -262,6 +262,7 @@ function client.openInventory(inv, data)
         end
     end
 
+	invOpen = true
     plyState.invOpen = true
 
     SetInterval(client.interval, 100)
@@ -319,6 +320,7 @@ exports('openInventory', client.openInventory)
 RegisterNetEvent('ox_inventory:forceOpenInventory', function(left, right)
 	if source == '' then return end
 
+    invOpen = true
 	plyState.invOpen = true
 
 	SetInterval(client.interval, 100)
@@ -932,7 +934,7 @@ function client.closeInventory(server)
 	if not client.interval then return end
 
 	if invOpen then
-		invOpen = nil
+		invOpen = false
 		SetNuiFocus(false, false)
 		SetNuiFocusKeepInput(false)
 		Utils.blurOut()
@@ -941,7 +943,7 @@ function client.closeInventory(server)
 		SetInterval(client.interval, 200)
 		Wait(200)
 
-		if invOpen ~= nil then return end
+		if invOpen then return end
 
 		if not server and currentInventory then
 			TriggerServerEvent('ox_inventory:closeInventory')
@@ -1689,6 +1691,7 @@ end)
 RegisterNetEvent('ox_inventory:viewInventory', function(left, right)
 	if source == '' then return end
 
+	invOpen = true
 	plyState.invOpen = true
 
 	SetInterval(client.interval, 100)
